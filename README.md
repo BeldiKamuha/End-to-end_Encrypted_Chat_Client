@@ -1,3 +1,5 @@
+Short-answer Questions
+
 	1.	Could the protocol be modified to increment the DH ratchets once every ten messages without compromising confidentiality?
 	•	Modifying the protocol to update the Diffie-Hellman (DH) ratchet every ten messages instead of every message would reduce the frequency of key updates. While this may still provide some confidentiality, it reduces the protection level against future compromise since the encryption keys would remain static longer, making it easier for an attacker to compromise multiple messages if they ever obtain a DH key.
 	2.	What if Alice and Bob never update their DH keys at all? Explain the security consequences.
