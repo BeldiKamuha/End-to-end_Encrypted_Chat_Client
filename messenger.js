@@ -1,7 +1,7 @@
+// messenger.js
 'use strict'
 
 /** ******* Imports ********/
-
 const {
   bufferToString,
   genRandomSalt,
@@ -12,14 +12,11 @@ const {
   HMACtoAESKey, // async
   HKDF, // async
   encryptWithGCM, // async
-  decryptWithGCM, // async
+  decryptWithGCM, // async,
   govEncryptionDataStr
 } = require('./lib')
 
-// Import subtle for cryptographic operations
 const { subtle } = require('node:crypto').webcrypto
-
-// Import the crypto module for hashing
 const crypto = require('node:crypto')
 
 /** ******* Implementation ********/
@@ -28,31 +25,48 @@ class MessengerClient {
   constructor (certAuthorityPublicKey, govPublicKey) {
     this.caPublicKey = certAuthorityPublicKey
     this.govPublicKey = govPublicKey
-    this.conns = {} // Active connections
-    this.certs = {} // Certificates of other users
-    this.EGKeyPair = {} // ElGamal key pair
-    this.receivedMessages = new Set() // Initialize the set for received message IDs
+    this.conns = {}
+    this.certs = {}
+    this.EGKeyPair = {}
+    this.receivedMessages = new Set()
   }
 
   async generateCertificate (username) {
     this.EGKeyPair = await generateEG()
-    const publicKey = this.EGKeyPair.pub
 
-    if (!publicKey) throw new Error('Public key generation failed.')
+    // Export public key in raw format, then encode it as base64
+    const publicKeyRaw = await subtle.exportKey('raw', this.EGKeyPair.pub)
+    const publicKey = Buffer.from(publicKeyRaw).toString('base64')
+    console.log(`Generated publicKey for ${username}:`, publicKey)
 
-    // Create certificate containing username and public key
+    // Create the certificate with a base64 public key
     const certificate = { username, publicKey }
     return certificate
   }
 
   async receiveCertificate (certificate, signature) {
     const certString = JSON.stringify(certificate)
-    const isValid = await verifyWithECDSA(this.caPublicKey, certString, signature)
+    console.log(`Receiving certificate for ${certificate.username}:`, certificate)
 
+    // Decode the base64 public key
+    const publicKeyBuffer = Buffer.from(certificate.publicKey, 'base64')
+    const publicKey = await subtle.importKey(
+      'raw',
+      publicKeyBuffer,
+      { name: 'ECDH', namedCurve: 'P-384' },
+      true,
+      []
+    )
+
+    // Re-create certificate with `CryptoKey` format
+    const certWithCryptoKey = { username: certificate.username, publicKey }
+
+    // Verify the certificate using the CA public key and signature
+    const isValid = await verifyWithECDSA(this.caPublicKey, certString, signature)
     if (!isValid) throw new Error('Certificate verification failed!')
 
-    // Store the valid certificate
-    this.certs[certificate.username] = certificate
+    this.certs[certificate.username] = certWithCryptoKey
+    console.log(`Certificate verified and stored for ${certificate.username}`)
   }
 
   async sendMessage (name, plaintext) {
@@ -63,48 +77,28 @@ class MessengerClient {
     const recipientCert = this.certs[name]
     const recipientPublicKey = recipientCert.publicKey
 
-    // Generate DH key pair and compute shared secret with recipient
     const dhKeyPair = await generateEG()
     const sharedSecret = await computeDH(dhKeyPair.sec, recipientPublicKey)
 
-    // Generate a salt for HKDF
     const salt = await HMACtoHMACKey(sharedSecret, 'salt')
+    const [derivedKey1] = await HKDF(sharedSecret, salt, 'ratchet-str')
+    const iv = genRandomSalt()
 
-    // Derive encryption keys using HKDF
-    const [, sendKey] = await HKDF(sharedSecret, salt, 'ratchet-str')
-
-    // Export sendKey to raw format
-    const sendKeyRaw = await subtle.exportKey('raw', sendKey)
-
-    // Generate 'iv' for message encryption
-    const iv = genRandomSalt() // Define 'iv' before using it
-
-    // *** Government Backdoor Implementation ***
-
-    // 1. Generate an ephemeral ECDH key pair for the government
     const govEphemeralKeyPair = await generateEG()
-
-    // 2. Compute shared secret with government's public key
     const govSharedSecret = await computeDH(govEphemeralKeyPair.sec, this.govPublicKey)
-
-    // 3. Derive symmetric key from shared secret
     const govSymmetricKey = await HMACtoAESKey(govSharedSecret, govEncryptionDataStr)
-
-    // 4. Encrypt the message key for the government
     const ivGov = genRandomSalt()
-    const cGov = await encryptWithGCM(govSymmetricKey, sendKeyRaw, ivGov)
+    const cGov = Buffer.from(await encryptWithGCM(govSymmetricKey, Buffer.from(await subtle.exportKey('raw', derivedKey1)), ivGov))
 
-    // Create message header including the government fields
     const header = {
-      dhPublicKey: dhKeyPair.pub,
-      iv,
-      vGov: govEphemeralKeyPair.pub,
-      ivGov,
-      cGov
+      dhPublicKey: Buffer.from(await subtle.exportKey('raw', dhKeyPair.pub)).toString('base64'),
+      iv: iv.toString('base64'),
+      vGov: Buffer.from(await subtle.exportKey('raw', govEphemeralKeyPair.pub)).toString('base64'),
+      ivGov: ivGov.toString('base64'),
+      cGov: cGov.toString('base64')
     }
 
-    // Now, include the header as authenticatedData when encrypting the message
-    const ciphertext = await encryptWithGCM(sendKey, plaintext, iv, JSON.stringify(header))
+    const ciphertext = Buffer.from(await encryptWithGCM(derivedKey1, plaintext, iv, JSON.stringify(header)))
 
     return [header, ciphertext]
   }
@@ -114,13 +108,12 @@ class MessengerClient {
       throw new Error("Sender's certificate not found!")
     }
 
-    // Compute a hash of the header and ciphertext to create a unique message ID
+    // Compute a unique message ID for replay attack prevention
     const messageId = crypto.createHash('sha256')
       .update(JSON.stringify(header))
       .update(Buffer.from(ciphertext))
       .digest('hex')
 
-    // Check if the message has already been processed
     if (this.receivedMessages.has(messageId)) {
       throw new Error('Replay attack detected: message has already been received.')
     }
@@ -128,19 +121,35 @@ class MessengerClient {
     // Store the message ID to prevent future replays
     this.receivedMessages.add(messageId)
 
-    const senderDhPublicKey = header.dhPublicKey
+    const senderDhPublicKeyBuffer = Buffer.from(header.dhPublicKey, 'base64')
+    const senderDhPublicKey = await subtle.importKey(
+      'raw',
+      senderDhPublicKeyBuffer,
+      { name: 'ECDH', namedCurve: 'P-384' },
+      true,
+      []
+    )
 
-    // Compute shared secret using own private key and sender's DH public key
+    // Compute shared secret using the own private key and sender's DH public key
     const sharedSecret = await computeDH(this.EGKeyPair.sec, senderDhPublicKey)
 
     // Generate a salt for HKDF
     const salt = await HMACtoHMACKey(sharedSecret, 'salt')
 
     // Derive decryption keys
-    const [, recvKey] = await HKDF(sharedSecret, salt, 'ratchet-str')
+    const [recvKey] = await HKDF(sharedSecret, salt, 'ratchet-str')
 
-    // Decrypt the message, including the header as authenticatedData
-    const plaintextBuffer = await decryptWithGCM(recvKey, ciphertext, header.iv, JSON.stringify(header))
+    // Decode IV from base64
+    const iv = Buffer.from(header.iv, 'base64')
+
+    // Decode authenticated data (header)
+    const authenticatedData = JSON.stringify(header)
+
+    // Convert ciphertext Buffer to ArrayBuffer
+    const ciphertextArrayBuffer = ciphertext.buffer.slice(ciphertext.byteOffset, ciphertext.byteOffset + ciphertext.byteLength)
+
+    // Decrypt the message using the derived key and including the header as authenticated data
+    const plaintextBuffer = await decryptWithGCM(recvKey, ciphertextArrayBuffer, iv, authenticatedData)
     return bufferToString(plaintextBuffer)
   }
 }
